@@ -141,6 +141,23 @@ def need(data, what, prev):
                  f"Check progress with `python bookpipe.py status`.")
 
 
+def as_obj(x):
+    """Models sometimes wrap a single JSON object in a list: [{...}]. Return the dict."""
+    if isinstance(x, list):
+        x = next((i for i in x if isinstance(i, dict)), {})
+    return x if isinstance(x, dict) else {}
+
+
+def load_good(name):
+    """Load a results file, dropping malformed (non-dict/empty) entries so they get redone."""
+    d = load(name, {})
+    good = {k: v for k, v in d.items() if isinstance(v, dict) and v}
+    if len(good) != len(d):
+        log(f"{name}: dropped {len(d) - len(good)} malformed entries, they will be redone")
+        save(name, good)
+    return good
+
+
 def parse_json(text):
     text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
     m = re.search(r"[\[{].*[\]}]", text, re.S)
@@ -307,7 +324,7 @@ needs_better_image (true if signature/fine print needs a higher-resolution crop)
 def cmd_extract(a):
     groups = load("groups.json", [])
     need(groups, "work/groups.json", "group --photos .\\photos")
-    data = load("extracted.json", {})
+    data = load_good("extracted.json")
     log(f"extract: {len(groups)} books, {len(data)} already done")
     for g in groups:
         k = str(g["superindex"])
@@ -316,7 +333,7 @@ def cmd_extract(a):
         parts = [EXTRACT_PROMPT]
         for fn in g["files"][:6]:
             parts += [f"File {fn}:", img_part(Path(a.photos) / fn, a.max_side)]
-        data[k] = ask(parts, FAST_MODEL)[0]
+        data[k] = as_obj(ask(parts, FAST_MODEL)[0])
         save("extracted.json", data)
         log(f"#{k}: {data[k].get('author', '')} - {str(data[k].get('title', ''))[:50]}")
 
@@ -341,9 +358,9 @@ Book data:
 
 
 def cmd_research(a):
-    ext = load("extracted.json", {})
+    ext = load_good("extracted.json")
     need(ext, "work/extracted.json", "extract --photos .\\photos")
-    data = load("researched.json", {})
+    data = load_good("researched.json")
     log(f"research: {len(ext)} books, {len(data)} already done")
     for k, rec in ext.items():
         if k in data:
@@ -351,6 +368,7 @@ def cmd_research(a):
         brief = {x: rec.get(x, "") for x in ("title", "author", "publisher", "publicationYear", "language",
                                               "condition", "signature", "signature_notes_sk", "visible_pages")}
         res, urls = ask([RESEARCH_PROMPT + json.dumps(brief, ensure_ascii=False)], FAST_MODEL, search=True)
+        res = as_obj(res)
         res["sources"] = urls
         data[k] = res
         save("researched.json", data)
@@ -389,9 +407,9 @@ def merged(k, ext, res):
 
 
 def cmd_price(a):
-    ext, res = load("extracted.json", {}), load("researched.json", {})
+    ext, res = load_good("extracted.json"), load_good("researched.json")
     need(ext, "work/extracted.json", "extract --photos .\\photos")
-    data = load("priced.json", {})
+    data = load_good("priced.json")
     log(f"price: {len(ext)} books, {len(data)} already done")
     for k in ext:
         if k in data:
@@ -401,6 +419,7 @@ def cmd_price(a):
                                                       "condition_price_impact_sk")})
         brief["descriptionSK"] = res.get(k, {}).get("descriptionSK", "")
         out, urls = ask([PRICE_PROMPT + json.dumps(brief, ensure_ascii=False)], SMART_MODEL, search=True)
+        out = as_obj(out)
         out["search_sources"] = urls
         data[k] = out
         save("priced.json", data)
@@ -417,9 +436,9 @@ def read_categories():
 
 def cmd_enrich(a):
     cats = read_categories()
-    ext, res = load("extracted.json", {}), load("researched.json", {})
+    ext, res = load_good("extracted.json"), load_good("researched.json")
     need(ext, "work/extracted.json", "extract --photos .\\photos")
-    data = load("enriched.json", {})
+    data = load_good("enriched.json")
     log(f"enrich: {len(ext)} books, {len(data)} already done")
     todo = [k for k in ext if k not in data]
     for i in range(0, len(todo), a.batch):
@@ -435,7 +454,12 @@ def cmd_enrich(a):
             '"descriptionEN": str, "descriptionDE": str}}. Unused categories = "".\n\n'
             + json.dumps(books, ensure_ascii=False))
         out, _ = ask([prompt], FAST_MODEL)
-        data.update({str(k): v for k, v in out.items()})
+        if isinstance(out, list):   # list of objects with an "id" -> convert to {id: obj}
+            out = {str(o.get("id")): o for o in out if isinstance(o, dict) and o.get("id") is not None}
+        if not isinstance(out, dict) or not out:
+            log("  WARNING: unusable answer for this batch, it will be retried on the next run")
+            continue
+        data.update({str(k): v for k, v in out.items() if isinstance(v, dict)})
         save("enriched.json", data)
         log(f"enriched {len(data)}/{len(ext)}")
 
@@ -448,8 +472,8 @@ def new_name(g, n, fn):
 def build_rows():
     cats = set(read_categories())
     groups = load("groups.json", [])
-    ext, res = load("extracted.json", {}), load("researched.json", {})
-    pr, en = load("priced.json", {}), load("enriched.json", {})
+    ext, res = load_good("extracted.json"), load_good("researched.json")
+    pr, en = load_good("priced.json"), load_good("enriched.json")
     rows, review, counters = [], [], {}
     for g in sorted(groups, key=lambda x: x["superindex"]):
         k = str(g["superindex"])
