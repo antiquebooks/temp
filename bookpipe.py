@@ -19,7 +19,8 @@ Stages (run in order; each is resumable, finished items are skipped):
   rename    copy images to <superindex>_<n>.<ext> so file names map to the superindex column
 
 Setup:  pip install google-genai pillow gspread ; export GEMINI_API_KEY=... ; create categories.txt
-Models: set FAST_MODEL / SMART_MODEL env vars to current Gemini model names if defaults fail.
+Models: run `python bookpipe.py models` to list what your key supports, then set the env vars
+        FAST_MODEL (images, research, translation) and SMART_MODEL (pricing) to names from that list.
 Originals are never modified or moved (rename COPIES unless you pass --move).
 """
 import argparse, csv, io, json, math, os, re, shutil, sys, time
@@ -62,21 +63,45 @@ def client():
     return genai.Client(api_key=key)
 
 
+def nk(text):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", text)]
+
+
 def natural_key(p):
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", Path(p).name)]
+    return nk(Path(p).name)
 
 
 def scan(photos):
-    """Return [(location_name, [Path,...]), ...] - one entry per folder, files in shooting order."""
+    """Return [(location_name, [Path,...]), ...] - one entry per top-level folder, files in shooting order.
+    Photos in deeper subfolders count towards their top-level folder. Exits with a clear message if nothing found."""
     root = Path(photos)
-    out = []
-    loose = sorted([p for p in root.iterdir() if p.suffix.lower() in EXTS], key=natural_key)
+    if not root.exists():
+        sys.exit(f"ERROR: folder not found: {root.resolve()}\nCheck the --photos path (run from the BookProject folder).")
+    other, out = {}, []
+
+    def pics(items):
+        res = []
+        for p in items:
+            if p.is_file():
+                if p.suffix.lower() in EXTS:
+                    res.append(p)
+                else:
+                    other[p.suffix.lower() or "(none)"] = other.get(p.suffix.lower() or "(none)", 0) + 1
+        return sorted(res, key=lambda p: nk(p.relative_to(root).as_posix()))
+
+    loose = pics(root.iterdir())
     if loose:
         out.append((root.name, loose))
     for d in sorted([d for d in root.iterdir() if d.is_dir()], key=natural_key):
-        fs = sorted([p for p in d.iterdir() if p.suffix.lower() in EXTS], key=natural_key)
+        fs = pics(d.rglob("*"))
         if fs:
             out.append((d.name, fs))
+    if other:
+        print(f"Note: ignored files with other extensions: {other} (supported: {sorted(EXTS)}; "
+              f"HEIC must be converted to JPG first)")
+    if not out:
+        sys.exit(f"ERROR: no photos found in {root.resolve()}\nExpected e.g. {root}/test/IMG_0001.jpg. "
+                 f"Contents: {[x.name for x in list(root.iterdir())[:10]]}")
     return out
 
 
@@ -100,6 +125,20 @@ def load(name, default):
 def save(name, data):
     WORK.mkdir(exist_ok=True)
     (WORK / name).write_text(json.dumps(data, ensure_ascii=False, indent=1), "utf-8")
+
+
+def log(msg):
+    """Print and append to work/log.txt"""
+    print(msg)
+    WORK.mkdir(exist_ok=True)
+    with open(WORK / "log.txt", "a", encoding="utf-8") as f:
+        f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + str(msg) + "\n")
+
+
+def need(data, what, prev):
+    if not data:
+        sys.exit(f"STOP: {what} is empty. Run `python bookpipe.py {prev}` first. "
+                 f"Check progress with `python bookpipe.py status`.")
 
 
 def parse_json(text):
@@ -156,6 +195,7 @@ def cmd_classify(a):
     labels = load("labels.json", {})
     for loc, files in scan(a.photos):
         todo = [i for i, f in enumerate(files) if rel(root, f) not in labels]
+        log(f"[{loc}] {len(files)} photos, {len(todo)} still to classify")
         if not todo:
             continue
         size, ctx, start = 20, 2, todo[0]
@@ -172,13 +212,25 @@ def cmd_classify(a):
             for i, f in enumerate(chunk, 1):
                 parts += [f"Image {i}:", img_part(f, 448)]
             result, _ = ask(parts, FAST_MODEL)
+            if isinstance(result, dict):
+                result = next((v for v in result.values() if isinstance(v, list)), [])
+            got = 0
             for item in result:
-                n = int(item["n"])
-                if n > c:
-                    labels[rel(root, chunk[n - 1])] = {"label": item["label"], "new_book": bool(item["new_book"])}
+                try:
+                    n = int(item["n"])
+                    if n > c:
+                        labels[rel(root, chunk[n - 1])] = {"label": item.get("label", ""),
+                                                           "new_book": bool(item.get("new_book"))}
+                        got += 1
+                except (KeyError, ValueError, IndexError, TypeError):
+                    continue
+            if got == 0:
+                log("  WARNING: the model returned no usable labels for this batch")
             save("labels.json", labels)
-            print(f"[{loc}] classified {min(start + size, len(files))}/{len(files)}")
+            log(f"[{loc}] classified up to {min(start + size, len(files))}/{len(files)}")
             start += size
+    log(f"classify done: {len(labels)} photos labelled, "
+        f"{sum(1 for v in labels.values() if v['new_book'])} covers detected")
 
 
 # ---------------- 2: group ----------------
@@ -200,7 +252,10 @@ def cmd_group(a):
             cur["files"].append(key)
     save("groups.json", groups)
     make_contact_sheets(a.photos, groups)
-    print(f"{len(groups)} books in {len(set(g['location'] for g in groups))} locations.")
+    unl = sum(1 for g in groups for fn in g["files"] if fn not in labels)
+    if unl:
+        log(f"WARNING: {unl} photos have no label - did `classify` run? Then every location becomes ONE book.")
+    log(f"group done: {len(groups)} books in {len(set(g['location'] for g in groups))} locations.")
     print("Review work/contact/*.jpg. Fix work/groups.json by hand (move file names between books) if needed.")
     over = [g["superindex"] for g in groups if len(g["files"]) > 4]
     if over:
@@ -251,7 +306,9 @@ needs_better_image (true if signature/fine print needs a higher-resolution crop)
 
 def cmd_extract(a):
     groups = load("groups.json", [])
+    need(groups, "work/groups.json", "group --photos .\\photos")
     data = load("extracted.json", {})
+    log(f"extract: {len(groups)} books, {len(data)} already done")
     for g in groups:
         k = str(g["superindex"])
         if k in data:
@@ -261,7 +318,7 @@ def cmd_extract(a):
             parts += [f"File {fn}:", img_part(Path(a.photos) / fn, a.max_side)]
         data[k] = ask(parts, FAST_MODEL)[0]
         save("extracted.json", data)
-        print(f"#{k}: {data[k].get('author', '')} - {str(data[k].get('title', ''))[:50]}")
+        log(f"#{k}: {data[k].get('author', '')} - {str(data[k].get('title', ''))[:50]}")
 
 
 # ---------------- 4: research (web) ----------------
@@ -285,7 +342,9 @@ Book data:
 
 def cmd_research(a):
     ext = load("extracted.json", {})
+    need(ext, "work/extracted.json", "extract --photos .\\photos")
     data = load("researched.json", {})
+    log(f"research: {len(ext)} books, {len(data)} already done")
     for k, rec in ext.items():
         if k in data:
             continue
@@ -295,7 +354,7 @@ def cmd_research(a):
         res["sources"] = urls
         data[k] = res
         save("researched.json", data)
-        print(f"#{k}: match={res.get('match_found')} pages={res.get('pages')}")
+        log(f"#{k}: match={res.get('match_found')} pages={res.get('pages')}")
 
 
 # ---------------- 5: price (web) ----------------
@@ -331,7 +390,9 @@ def merged(k, ext, res):
 
 def cmd_price(a):
     ext, res = load("extracted.json", {}), load("researched.json", {})
+    need(ext, "work/extracted.json", "extract --photos .\\photos")
     data = load("priced.json", {})
+    log(f"price: {len(ext)} books, {len(data)} already done")
     for k in ext:
         if k in data:
             continue
@@ -343,7 +404,7 @@ def cmd_price(a):
         out["search_sources"] = urls
         data[k] = out
         save("priced.json", data)
-        print(f"#{k}: {out.get('priceMin')}-{out.get('priceMax')} EUR (level {out.get('level')})")
+        log(f"#{k}: {out.get('priceMin')}-{out.get('priceMax')} EUR (level {out.get('level')})")
 
 
 # ---------------- 6: enrich (text only) ----------------
@@ -357,7 +418,9 @@ def read_categories():
 def cmd_enrich(a):
     cats = read_categories()
     ext, res = load("extracted.json", {}), load("researched.json", {})
+    need(ext, "work/extracted.json", "extract --photos .\\photos")
     data = load("enriched.json", {})
+    log(f"enrich: {len(ext)} books, {len(data)} already done")
     todo = [k for k in ext if k not in data]
     for i in range(0, len(todo), a.batch):
         ids = todo[i: i + a.batch]
@@ -374,7 +437,7 @@ def cmd_enrich(a):
         out, _ = ask([prompt], FAST_MODEL)
         data.update({str(k): v for k, v in out.items()})
         save("enriched.json", data)
-        print(f"enriched {len(data)}/{len(ext)}")
+        log(f"enriched {len(data)}/{len(ext)}")
 
 
 # ---------------- 7: export ----------------
@@ -465,11 +528,12 @@ def write_csv(path, fields, rows):
 
 
 def cmd_export(a):
+    need(load("extracted.json", {}), "work/extracted.json (no books extracted yet)", "extract --photos .\\photos")
     rows, review = build_rows()
     write_csv("books.csv", COLUMNS, rows)
     write_csv("books_review.csv", list(review[0].keys()) if review else ["superindex"], review)
     flagged = sum(1 for r in review if r["needs_review"])
-    print(f"books.csv: {len(rows)} books (your exact schema). books_review.csv: {flagged} flagged for review.")
+    log(f"books.csv: {len(rows)} books (your exact schema). books_review.csv: {flagged} flagged for review.")
     if a.sheets:
         import gspread
         gc = gspread.service_account(filename=os.environ.get("GSPREAD_KEY", "service_account.json"))
@@ -492,17 +556,46 @@ def cmd_rename(a):
     print(f"{n_done} files {'moved' if a.move else 'copied'} to {out}/ as <superindex>_<n>.<ext>")
 
 
+# ---------------- status ----------------
+def cmd_status(a):
+    if a.photos:
+        print("PHOTOS FOUND:")
+        for loc, files in scan(a.photos):
+            print(f"  {loc}: {len(files)} photos")
+    print("PROGRESS (work/ folder):")
+    for name in ("labels", "groups", "extracted", "researched", "priced", "enriched"):
+        d = load(f"{name}.json", None)
+        print(f"  {name:10s}: " + ("missing - stage not run yet" if d is None else f"{len(d)} entries"))
+    lg = WORK / "log.txt"
+    if lg.exists():
+        print("LAST LOG LINES:")
+        for line in lg.read_text("utf-8").splitlines()[-8:]:
+            print("  " + line)
+
+
+# ---------------- models ----------------
+def cmd_models(a):
+    print(f"Currently configured: FAST_MODEL={FAST_MODEL}  SMART_MODEL={SMART_MODEL}\n")
+    print("Models your API key can use for generateContent:")
+    for m in client().models.list():
+        acts = getattr(m, "supported_actions", None) or []
+        if not acts or "generateContent" in acts:
+            print("  " + m.name.replace("models/", ""))
+
+
 # ---------------- cli ----------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name, fn in [("classify", cmd_classify), ("group", cmd_group), ("extract", cmd_extract),
                      ("research", cmd_research), ("price", cmd_price), ("enrich", cmd_enrich),
-                     ("export", cmd_export), ("rename", cmd_rename)]:
+                     ("export", cmd_export), ("rename", cmd_rename), ("models", cmd_models), ("status", cmd_status)]:
         s = sub.add_parser(name)
         s.set_defaults(fn=fn)
         if name in ("classify", "group", "extract", "rename"):
             s.add_argument("--photos", required=True, help="root folder; each subfolder = one location")
+        if name == "status":
+            s.add_argument("--photos", default=None, help="optional: also count photos per folder")
         if name == "group":
             s.add_argument("--force", action="store_true", help="overwrite existing work/groups.json")
         if name == "extract":
