@@ -32,8 +32,8 @@ from google import genai
 from google.genai import types
 
 WORK = Path("work")
-FAST_MODEL = os.environ.get("FAST_MODEL", "gemini-2.5-flash")   # classify, extract, research, enrich
-SMART_MODEL = os.environ.get("SMART_MODEL", "gemini-2.5-pro")   # pricing
+FAST_MODEL = os.environ.get("FAST_MODEL", "gemini-3.1-flash-lite")   # classify, extract, research, enrich
+SMART_MODEL = os.environ.get("SMART_MODEL", "gemini-4-hydrogen")   # pricing
 EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
 LABELS = ["cover", "back_cover", "spine", "title_page", "half_title",
           "flyleaf_or_signature", "colophon", "interior", "other"]
@@ -171,6 +171,7 @@ def ask(parts, model, search=False, retries=5):
         cfg.tools = [types.Tool(google_search=types.GoogleSearch())]
     else:
         cfg.response_mime_type = "application/json"
+    quota_hits = 0
     for attempt in range(retries):
         try:
             r = client().models.generate_content(model=model, contents=parts, config=cfg)
@@ -181,10 +182,24 @@ def ask(parts, model, search=False, retries=5):
                         urls.append(ch.web.uri)
             except Exception:
                 pass
-            return parse_json(r.text), urls
+            result = parse_json(r.text)
+            pause = float(os.environ.get("PAUSE", "0"))   # optional delay between calls to stay under per-minute limits
+            if pause:
+                time.sleep(pause)
+            return result, urls
         except Exception as e:
-            wait = 15 * (attempt + 1)
-            print(f"  ! {type(e).__name__}: {str(e)[:120]} - retry in {wait}s")
+            msg = str(e)
+            if "RESOURCE_EXHAUSTED" in msg or "429" in msg[:40]:
+                quota_hits += 1
+                if quota_hits >= 3:
+                    log("STOP: Gemini quota exhausted (429). Progress is saved. Check billing / rate limits at "
+                        "https://aistudio.google.com/usage , wait for the quota to reset or enable billing, "
+                        "then run the same command again.")
+                    sys.exit(1)
+                wait = 60
+            else:
+                wait = 15 * (attempt + 1)
+            print(f"  ! {type(e).__name__}: {msg[:120]} - retry in {wait}s")
             time.sleep(wait)
     raise RuntimeError("Gave up after retries (quota?). Re-run later; progress is saved.")
 
@@ -303,6 +318,37 @@ def make_contact_sheets(folder, groups, per_page=10, h=260):
         sheet.save(out / f"page_{pg // per_page + 1:03d}.jpg", quality=80)
 
 
+# ---------------- sync after hand-edited groups.json ----------------
+def sync_stale(groups=None):
+    """If you hand-edited work/groups.json, drop results made from a different set of photos so they get redone."""
+    groups = groups if groups is not None else load("groups.json", [])
+    if not groups:
+        return
+    ext = load("extracted.json", {})
+    valid = {str(g["superindex"]): g["files"] for g in groups}
+    stale = [k for k, e in ext.items()
+             if k not in valid or not isinstance(e, dict) or e.get("_files") != valid[k]]
+    if not stale:
+        return
+    for name in ("extracted", "researched", "priced", "enriched"):
+        d = load(f"{name}.json", {})
+        kept = {k: v for k, v in d.items() if k not in stale}
+        if len(kept) != len(d):
+            save(f"{name}.json", kept)
+    log(f"sync: {len(stale)} books ({', '.join(sorted(stale, key=int))}) were extracted from a different photo "
+        f"set than groups.json now has (or before this check existed) - their results were dropped and will be redone")
+
+
+def cmd_contact(a):
+    groups = load("groups.json", [])
+    need(groups, "work/groups.json", "group --photos .\\photos")
+    out = WORK / "contact"
+    for old in out.glob("page_*.jpg"):
+        old.unlink()
+    make_contact_sheets(a.photos, groups)
+    log(f"contact sheets rebuilt from work/groups.json: {len(groups)} books")
+
+
 # ---------------- 3: extract (images only) ----------------
 EXTRACT_PROMPT = f"""You are an expert antiquarian cataloger. These photos show ONE book (cover first, then detail photos).
 {PROVENANCE}
@@ -324,6 +370,7 @@ needs_better_image (true if signature/fine print needs a higher-resolution crop)
 def cmd_extract(a):
     groups = load("groups.json", [])
     need(groups, "work/groups.json", "group --photos .\\photos")
+    sync_stale(groups)
     data = load_good("extracted.json")
     log(f"extract: {len(groups)} books, {len(data)} already done")
     for g in groups:
@@ -334,6 +381,7 @@ def cmd_extract(a):
         for fn in g["files"][:6]:
             parts += [f"File {fn}:", img_part(Path(a.photos) / fn, a.max_side)]
         data[k] = as_obj(ask(parts, FAST_MODEL)[0])
+        data[k]["_files"] = g["files"]
         save("extracted.json", data)
         log(f"#{k}: {data[k].get('author', '')} - {str(data[k].get('title', ''))[:50]}")
 
@@ -358,6 +406,7 @@ Book data:
 
 
 def cmd_research(a):
+    sync_stale()
     ext = load_good("extracted.json")
     need(ext, "work/extracted.json", "extract --photos .\\photos")
     data = load_good("researched.json")
@@ -407,6 +456,7 @@ def merged(k, ext, res):
 
 
 def cmd_price(a):
+    sync_stale()
     ext, res = load_good("extracted.json"), load_good("researched.json")
     need(ext, "work/extracted.json", "extract --photos .\\photos")
     data = load_good("priced.json")
@@ -435,6 +485,7 @@ def read_categories():
 
 
 def cmd_enrich(a):
+    sync_stale()
     cats = read_categories()
     ext, res = load_good("extracted.json"), load_good("researched.json")
     need(ext, "work/extracted.json", "extract --photos .\\photos")
@@ -552,6 +603,7 @@ def write_csv(path, fields, rows):
 
 
 def cmd_export(a):
+    sync_stale()
     need(load("extracted.json", {}), "work/extracted.json (no books extracted yet)", "extract --photos .\\photos")
     rows, review = build_rows()
     write_csv("books.csv", COLUMNS, rows)
@@ -613,10 +665,10 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name, fn in [("classify", cmd_classify), ("group", cmd_group), ("extract", cmd_extract),
                      ("research", cmd_research), ("price", cmd_price), ("enrich", cmd_enrich),
-                     ("export", cmd_export), ("rename", cmd_rename), ("models", cmd_models), ("status", cmd_status)]:
+                     ("export", cmd_export), ("rename", cmd_rename), ("models", cmd_models), ("status", cmd_status), ("contact", cmd_contact)]:
         s = sub.add_parser(name)
         s.set_defaults(fn=fn)
-        if name in ("classify", "group", "extract", "rename"):
+        if name in ("classify", "group", "extract", "rename", "contact"):
             s.add_argument("--photos", required=True, help="root folder; each subfolder = one location")
         if name == "status":
             s.add_argument("--photos", default=None, help="optional: also count photos per folder")
